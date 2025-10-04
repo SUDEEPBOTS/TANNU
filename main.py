@@ -11,14 +11,12 @@ from telegram.helpers import mention_html
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-SITE_URL = os.getenv("SITE_URL", "https://example.com")  # OpenRouter attribution
-SITE_NAME = os.getenv("SITE_NAME", "DeepSeek TG Bot")
-
+SITE_URL = os.getenv("SITE_URL", "https://example.com")   # OpenRouter attribution
+SITE_NAME = os.getenv("SITE_NAME", "DeepSeek TG Bot")     # OpenRouter attribution
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat-v3.1:free")
 
-# Owner + AI persona
 OWNER_NAME = os.getenv("OWNER_NAME", "Sudeep")
-AI_NAME = os.getenv("AI_NAME", "Sudeep")  # AI ka naam bhi Sudeep
+AI_NAME = os.getenv("AI_NAME", "Sudeep")  # AI ka naam
 
 HOME_GROUP_LINK = os.getenv("HOME_GROUP_LINK", "https://t.me/+y_unsn_S2eNkNzg1")
 
@@ -35,9 +33,9 @@ client = OpenAI(
 )
 
 # ========= In-memory stores =========
-chat_history = {}       # per-chat AI context
-user_names = {}         # {user_id: preferred display name}
-nick_map = {}           # {chat_id: {lower_nick: user_id}} for "hello tannu"
+chat_history = {}        # per-chat AI context
+user_names = {}          # {user_id: preferred name}
+nick_map = {}            # {chat_id: {lower_nick: user_id}}
 
 def get_chat_nicks(chat_id: int):
     return nick_map.setdefault(chat_id, {})
@@ -53,7 +51,6 @@ hello_set = {"hi", "hello", "hlo", "hey", "yo", "namaste", "namaskar"}
 
 # ========= Helpers =========
 def now_ist():
-    # Add zoneinfo for strict IST if needed
     return dt.datetime.now()
 
 def norm_token(s: str) -> str:
@@ -72,10 +69,8 @@ def is_bot_mentioned(msg, bot_username: str) -> bool:
 
 def extract_hello_target(msg):
     """
-    Returns tuple: (is_hello, target_user_id, target_username_str)
-    - If text starts with a hello-token and contains TEXT_MENTION -> user_id returned.
-    - If contains @username MENTION -> username string returned.
-    - Else if just 'hello' without target -> (True, None, None)
+    (is_hello, target_user_id, target_username_str)
+    TEXT_MENTION -> user_id; MENTION -> '@username' string; else None.
     """
     text = msg.text or ""
     first = norm_token(text.split()[0] if text.split() else "")
@@ -86,7 +81,7 @@ def extract_hello_target(msg):
             if ent.type == MessageEntity.TEXT_MENTION and ent.user:
                 return (True, ent.user.id, None)
             if ent.type == MessageEntity.MENTION:
-                seg = text[ent.offset: ent.offset + ent.length]  # like @tannu
+                seg = text[ent.offset: ent.offset + ent.length]
                 return (True, None, seg)
     return (True, None, None)
 
@@ -99,10 +94,7 @@ def extract_plain_target_word(text: str):
 def contains_profanity(text: str) -> bool:
     if not text:
         return False
-    bad_words = [
-        "bc", "mc", "bhosdi", "madarchod", "chod", "gandu", "chutiya", "chut", "lund",
-        "randi", "haraami", "harami"
-    ]
+    bad_words = ["bc","mc","bhosdi","madarchod","chod","gandu","chutiya","chut","lund","randi","haraami","harami"]
     t = text.lower()
     pattern = r"\b(" + "|".join(map(re.escape, bad_words)) + r")\b"
     return re.search(pattern, t) is not None
@@ -122,7 +114,7 @@ async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_bot_profile(context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
-    return me.first_name, me.username
+    return me.first_name, me.username, me.id
 
 def resolve_user_display(user) -> str:
     if not user:
@@ -138,22 +130,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /start, /help, /whoami, /reset, /setnick
-"
-        "- Groups: mention @bot par reply; 'hello/hi' par limited greet (cooldown).
-"
-        "- Reply to bot to continue chat without mention.
-"
-        "- Apna naam set: 'mera naam <Name>'.
-"
-        "- /setnick @user <nick> to map 'hello nick' → tag that user.
-"
-        "- 'ghar/home' par home link, 'time/date' par exact time + group title."
+        "Commands: /start, /help, /whoami, /reset, /setnick — Groups: mention @bot par reply; 'hello/hi' par limited greet (cooldown); Reply to bot to continue chat; Apna naam: 'mera naam <Name>'; /setnick @user <nick> → 'hello nick' tags that user; 'ghar/home' se home link; 'time/date' se exact time + group title."
     )
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    me_name, me_user = await get_bot_profile(context)
-    await update.message.reply_text(f"Mera naam {me_name} ({AI_NAME}) hai (username: @{me_user}). Owner: {OWNER_NAME}")
+    me_name, me_user, _ = await get_bot_profile(context)
+    await update.message.reply_text(f"Mera naam {AI_NAME} hai (display: {me_name}, @{me_user}). Owner: {OWNER_NAME}")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -161,33 +143,23 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Context reset ho gaya.")
 
 async def setnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # usage: /setnick @user nickname (suggest: reply to user's message for reliable mapping)
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text("Use: /setnick @user nickname (or reply to user's msg with /setnick nickname)")
-        return
-    target_user = None
-    nick = None
-    if update.message.reply_to_message and len(context.args) >= 1:
-        # Reply-based: /setnick nickname
+    # /setnick @user nickname OR reply to user's msg then /setnick nickname
+    if update.message.reply_to_message and context.args:
         target_user = update.message.reply_to_message.from_user
         nick = " ".join(context.args).strip().lower()
     else:
-        # Handle + nickname
-        if len(context.args) < 2:
-            await update.message.reply_text("Use: /setnick @user nickname")
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text("Use: Reply to user's msg → /setnick nickname  OR  /setnick @user nickname (TEXT_MENTION preferred)")
             return
-        handle = context.args[0]
+        target_user = None
         nick = " ".join(context.args[1:]).strip().lower()
-        # Try TEXT_MENTION first
         if update.message.entities:
-            text = update.message.text
             for e in update.message.entities:
                 if e.type == MessageEntity.TEXT_MENTION and e.user:
                     target_user = e.user
                     break
-        # If only @username MENTION given, we can’t resolve id reliably without extra API; require reply/TextMention
         if not target_user:
-            await update.message.reply_text("User ko reply karke /setnick nickname bhejo, ya TEXT_MENTION use karo.")
+            await update.message.reply_text("User resolve nahi hua. Reply karke /setnick nickname use karo.")
             return
     if not nick or not target_user:
         await update.message.reply_text("Nickname ya user missing.")
@@ -204,7 +176,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     low = txt.lower()
     chat = update.effective_chat
 
-    # Capture user preferred name: "mera naam XYZ" or "my name XYZ"
+    # Set preferred name: "mera naam XYZ" / "my name XYZ"  (hyphen-safe char class)
     m = re.search(r"\b(mera|my)s+naams+([A-Za-z0-9_. -]{1,32})", txt, flags=re.IGNORECASE)
     if m:
         name = m.group(2).strip()
@@ -212,24 +184,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Thik hai, yaad rakha: {name}")
         return
 
-    # User asks for their username
+    # User asks: their username
     if "mera username" in low or "my username" in low:
         u = msg.from_user
         await msg.reply_text(f"Tumhara username: @{u.username}" if u.username else "Tumhara username set nahin hai.")
         return
 
-    # User asks for their name
-    if "mera naam" in low and "mera naam " not in low or "my name" in low:
+    # User asks: their name
+    if ("my name" in low) or ("mera naam" in low and not re.search(r"\b(mera|my)s+naams+[A-Za-z0-9_. -]{1,32}", low)):
         u = msg.from_user
         saved = user_names.get(u.id)
         display = saved or (u.first_name or "User")
-        mention = mention_html(u.id, display)
-        await msg.reply_html(f"Tumhara naam: {mention}")
+        await msg.reply_html(f"Tumhara naam: {mention_html(u.id, display)}")
         return
 
     # Owner/bot name Q&A
     if "tumhara naam" in low or "tera naam" in low or "what is your name" in low:
-        me_name, me_user = await get_bot_profile(context)
+        me_name, me_user, _ = await get_bot_profile(context)
         await msg.reply_text(f"Mera naam {AI_NAME} hai (display: {me_name}, @{me_user}). Owner: {OWNER_NAME}")
         return
     if "owner" in low:
@@ -239,8 +210,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Group moderation: profanity
     if contains_profanity(txt):
         user = msg.from_user
-        mention = mention_html(user.id, resolve_user_display(user))
-        warn = f"{mention} Kripya gaali-galoch se bachen. Sabka respect karein."
+        warn = f"{mention_html(user.id, resolve_user_display(user))} Kripya gaali-galoch se bachen. Sabka respect karein."
         try:
             await msg.reply_html(warn)
         except Exception:
@@ -248,15 +218,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Group behavior
-    me_name, me_user = await get_bot_profile(context)
+    me_name, me_user, me_id = await get_bot_profile(context)
     if chat.type in ("group", "supergroup"):
         is_reply = msg.reply_to_message is not None
-        reply_to_bot = bool(is_reply and msg.reply_to_message.from_user and msg.reply_to_message.from_user.username == me_user)
+        reply_to_bot = bool(is_reply and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == me_id)
 
-        # Allow replies to bot (continue convo)
         if reply_to_bot:
             pass  # continue intents/AI
-        # Allow explicit @mention
         elif is_bot_mentioned(msg, me_user):
             pass
         else:
@@ -271,11 +239,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     greet_cooldown_user[key_u] = now
                     greet_cooldown_chat[chat.id] = now
                     await send_typing(update, context)
-                    mention = mention_html(msg.from_user.id, resolve_user_display(msg.from_user))
-                    await msg.reply_html(f"Hello {mention}! Kaise ho?")
+                    await msg.reply_html(f"Hello {mention_html(msg.from_user.id, resolve_user_display(msg.from_user))}! Kaise ho?")
                 return
 
-            # Targeted greeting: “hello @user” or “hello <nick>”
+            # Targeted greeting: “hello @user” or via /setnick
             is_hello, target_uid, target_username = extract_hello_target(msg)
             if is_hello:
                 now = monotonic()
@@ -288,26 +255,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await send_typing(update, context)
                     sender = mention_html(msg.from_user.id, resolve_user_display(msg.from_user))
                     if target_uid:
-                        target = mention_html(target_uid, "friend")
-                        await msg.reply_html(f"Hello {target}! {sender} ne greet kiya. Kaise ho?")
+                        await msg.reply_html(f"Hello {mention_html(target_uid, 'friend')}! {sender} ne greet kiya. Kaise ho?")
                     elif target_username:
                         await msg.reply_text(f"Hello {target_username}! {resolve_user_display(msg.from_user)} ne greet kiya. Kaise ho?")
                     else:
-                        # Try plain target via nick_map
                         nick = extract_plain_target_word(txt)
-                        uid = get_chat_nicks(chat.id).get(nick or "", None)
+                        uid = get_chat_nicks(chat.id).get((nick or ""), None)
                         if uid:
-                            target = mention_html(uid, nick or "friend")
-                            await msg.reply_html(f"Hello {target}! {sender} ne greet kiya. Kaise ho?")
+                            await msg.reply_html(f"Hello {mention_html(uid, nick or 'friend')}! {sender} ne greet kiya. Kaise ho?")
                         else:
                             await msg.reply_html(f"Hello {sender}! Kaise ho?")
                 return
 
-            # Home/time without reply/mention -> ignore to prevent noise
+            # Other non-mention/non-reply messages in group → ignore
             return
 
-    # Intents (work in private, and in groups when allowed by above pass)
-    if any(k in low for k in ["ghar", "home", "group", "link"]) and any(q in low for q in ["konsa", "kaunsa", "kya", "tumhara", "tumhra", "kaha"]):
+    # Intents (private always, group only when allowed above)
+    if any(k in low for k in ["ghar", "home", "group", "link"]) and any(q in low for q in ["konsa","kaunsa","kya","tumhara","tumhra","kaha"]):
         await msg.reply_text(f"Mera home group: {HOME_GROUP_LINK}")
         return
 
@@ -317,15 +281,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} | Group: {title}")
         return
 
-    # Private chats or allowed group paths → AI
+    # AI response (private, or allowed group cases)
     await send_typing(update, context)
     chat_id = chat.id
     append_history(chat_id, "user", txt)
     try:
-        completion = client.chat.completions.create(
-            model=MODEL,
-            messages=chat_history.get(chat_id)
-        )
+        completion = client.chat.completions.create(model=MODEL, messages=chat_history.get(chat_id))
         reply = completion.choices[0].message.content
         append_history(chat_id, "assistant", reply)
         await msg.reply_text(reply)
@@ -337,27 +298,22 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-    # Ignore if sticker is a reply to someone (not the bot)
     if msg.reply_to_message is not None:
-        # If replying to bot's sticker/message and you want to react, change condition:
-        me_name, me_user = await get_bot_profile(context)
-        if msg.reply_to_message.from_user and msg.reply_to_message.from_user.username == me_user:
-            pass
-        else:
+        me_name, me_user, me_id = await get_bot_profile(context)
+        if not (msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == me_id):
             return
     st = msg.sticker
     if not st:
         return
     await send_typing(update, context)
-    kind = "sticker"
     try:
         emoji = getattr(st, "emoji", None) or "🧩"
+        kind = "sticker"
         if getattr(st, "is_animated", False):
             kind = "animated sticker"
         elif getattr(st, "is_video", False):
             kind = "video sticker"
-        reply_text = f"Nice {kind} {emoji}!"
-        await msg.reply_text(reply_text)
+        await msg.reply_text(f"Nice {kind} {emoji}!")
     except Exception:
         await msg.reply_text("Cool sticker!")
 
@@ -369,10 +325,8 @@ def main():
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("setnick", setnick))
-
     app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
