@@ -6,21 +6,12 @@ from telegram import Update, MessageEntity
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.helpers import mention_html
 
-# ========= Config / Constants =========
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-# Optional attribution for OpenRouter
 SITE_URL = os.getenv("SITE_URL", "https://example.com")
 SITE_NAME = os.getenv("SITE_NAME", "DeepSeek TG Bot")
-
-# DeepSeek model via OpenRouter
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat-v3.1:free")
-
-# Owner memory
 OWNER_NAME = os.getenv("OWNER_NAME", "Sudeep")
-
-# Home group link
 HOME_GROUP_LINK = os.getenv("HOME_GROUP_LINK", "https://t.me/+y_unsn_S2eNkNzg1")
 
 if not OPENROUTER_API_KEY:
@@ -28,27 +19,18 @@ if not OPENROUTER_API_KEY:
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
-# ========= OpenRouter client =========
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
-    default_headers={
-        "HTTP-Referer": SITE_URL,
-        "X-Title": SITE_NAME
-    }
+    default_headers={"HTTP-Referer": SITE_URL, "X-Title": SITE_NAME}
 )
 
-# ========= In-memory stores =========
-# Per-chat conversation for AI context
 chat_history = {}
-# Per-user memory: preferred display name
-user_names = {}  # {user_id: "Deep"}
+user_names = {}
 
-WELCOME = "Namaste! Hinglish me baat karo, main DeepSeek se reply dunga 😊"
+WELCOME = "Namaste! 😊"
 
-# ========= Helpers =========
 def now_ist():
-    # For IST specifically, replace with zoneinfo if needed.
     return dt.datetime.now()
 
 def is_bot_mentioned(msg, bot_username: str) -> bool:
@@ -71,10 +53,7 @@ def text_matches_hello(text: str) -> bool:
 def contains_profanity(text: str) -> bool:
     if not text:
         return False
-    bad_words = [
-        "bc", "mc", "bhosdi", "madarchod", "chod", "gandu", "chutiya", "chut", "lund",
-        "randi", "haraami", "harami"
-    ]
+    bad_words = ["bc","mc","bhosdi","madarchod","chod","gandu","chutiya","chut","lund","randi","haraami","harami"]
     t = text.lower()
     pattern = r"\b(" + "|".join(map(re.escape, bad_words)) + r")\b"
     return re.search(pattern, t) is not None
@@ -104,21 +83,12 @@ def resolve_user_display(user) -> str:
         return user_names[uid]
     return user.first_name or "User"
 
-# ========= Commands =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /start, /help, /whoami, /reset
-"
-        "- Groups: mention @bot par reply karta hoon; 'hello/hi' par tag karke greet karta hoon.
-"
-        "- Apna naam set: 'mera naam <Name>'
-"
-        "- 'ghar/home' pucho to home group link deta hoon.
-"
-        "- Time/date pucho to exact time aur group title bataata hoon."
+        "Commands: /start, /help, /whoami, /reset — Groups: mention @bot par reply karta hoon; 'hello/hi' par tag karke greet karta hoon; Apna naam set: 'mera naam <Name>'; 'ghar/home' pucho to home group link; Time/date pucho to exact time aur group title."
     )
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -130,7 +100,6 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_history.pop(chat_id, None)
     await update.message.reply_text("Context reset ho gaya.")
 
-# ========= Text handler =========
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -138,7 +107,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = msg.text or ""
     low = txt.lower()
 
-    # Per-user name capture: "mera naam XYZ" or "my name XYZ"
     m = re.search(r"\b(mera|my)s+naams+([A-Za-z0-9_.- ]{1,32})", txt, flags=re.IGNORECASE)
     if m:
         name = m.group(2).strip()
@@ -146,7 +114,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Thik hai, yaad rakha: {name}")
         return
 
-    # User asks their username
     if "mera username" in low or "my username" in low:
         u = msg.from_user
         if u.username:
@@ -155,7 +122,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Tumhara username set nahin hai.")
         return
 
-    # User asks their name
     if "mera naam" in low or "my name" in low:
         u = msg.from_user
         saved = user_names.get(u.id)
@@ -164,7 +130,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_html(f"Tumhara naam: {mention}")
         return
 
-    # Owner/bot name Q&A
     if "tumhara naam" in low or "tera naam" in low or "what is your name" in low:
         me_name, me_user = await get_bot_profile(context)
         await msg.reply_text(f"Mera naam {me_name} hai (username: @{me_user}). Owner: {OWNER_NAME}")
@@ -173,12 +138,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Owner: {OWNER_NAME}")
         return
 
-    # Home/ghar queries
     if any(k in low for k in ["ghar", "home", "group", "link"]) and any(q in low for q in ["konsa", "kaunsa", "kya"]):
         await msg.reply_text(f"Mera home group: {HOME_GROUP_LINK}")
         return
 
-    # Time/date and group info
     if any(k in low for k in ["time", "date", "samay", "waqt"]):
         now = now_ist()
         chat = update.effective_chat
@@ -186,7 +149,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} | Group: {title}")
         return
 
-    # Group moderation: profanity
     if contains_profanity(txt):
         user = msg.from_user
         mention = mention_html(user.id, resolve_user_display(user))
@@ -197,12 +159,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Language theek rakhein, kripya.")
         return
 
-    # Group behavior: mention-only or hello-greeting
     chat = update.effective_chat
     me_name, me_user = await get_bot_profile(context)
     if chat.type in ("group", "supergroup"):
         if is_bot_mentioned(msg, me_user):
-            pass  # continue to AI
+            pass
         elif text_matches_hello(txt):
             await send_typing(update, context)
             user = msg.from_user
@@ -210,29 +171,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_html(f"Hello {mention}! Kaise ho?")
             return
         else:
-            return  # ignore other group messages
+            return
 
-    # Private chats: always respond via AI
     await send_typing(update, context)
     chat_id = chat.id
     append_history(chat_id, "user", txt)
     try:
-        completion = client.chat.completions.create(
-            model=MODEL,
-            messages=chat_history.get(chat_id)
-        )
+        completion = client.chat.completions.create(model=MODEL, messages=chat_history.get(chat_id))
         reply = completion.choices[0].message.content
         append_history(chat_id, "assistant", reply)
         await msg.reply_text(reply)
     except Exception:
         await msg.reply_text("OpenRouter/API error. Thodi der baad try karo.")
 
-# ========= Sticker handler =========
 async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-    # Ignore if sticker is a reply to another message
     if msg.reply_to_message is not None:
         return
     st = msg.sticker
@@ -251,18 +206,14 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await msg.reply_text("Cool sticker!")
 
-# ========= App bootstrap =========
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("reset", reset))
-
-    # Handlers
     app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
