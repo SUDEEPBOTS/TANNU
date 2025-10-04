@@ -1,12 +1,15 @@
 import os
 import re
 import time
+import asyncio
 import datetime as dt
 from time import monotonic
 from openai import OpenAI
 from telegram import Update, MessageEntity
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.helpers import mention_html
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 
 # ========= Env & Constants =========
 SITE_URL = os.getenv("SITE_URL", "https://example.com")
@@ -17,7 +20,7 @@ OWNER_NAME = os.getenv("OWNER_NAME", "Sudeep")
 AI_NAME = os.getenv("AI_NAME", "Sudeep")
 HOME_GROUP_LINK = os.getenv("HOME_GROUP_LINK", "https://t.me/+y_unsn_S2eNkNzg1")
 
-# Collect up to 10+1 keys
+# Gather up to 11 keys (base + 1..10)
 KEY_ENV_NAMES = [
     "OPENROUTER_API_KEY",
     "OPENROUTER_API_KEY1","OPENROUTER_API_KEY2","OPENROUTER_API_KEY3","OPENROUTER_API_KEY4",
@@ -29,7 +32,6 @@ for n in KEY_ENV_NAMES:
     v = os.getenv(n)
     if v and v.strip():
         KEY_LIST.append(v.strip())
-
 if not KEY_LIST:
     raise RuntimeError("At least one OPENROUTER_API_KEY is required")
 
@@ -44,15 +46,14 @@ hello_set = {"hi","hello","hlo","hey","yo","namaste","namaskar"}
 
 # ========= Key Pool with Failover =========
 class ORKeyPool:
-    def __init__(self, keys, cooldown_ok=30, cooldown_rl=90, cooldown_bad=3600):
-        self.keys = list(dict.fromkeys([k for k in keys if k]))  # unique, keep order
+    def __init__(self, keys, cooldown_rl=90, cooldown_bad=3600):
+        self.keys = list(dict.fromkeys([k for k in keys if k]))
         if not self.keys:
             raise RuntimeError("No OpenRouter keys provided")
         self.i = 0
         self.blocked_until = {k: 0.0 for k in self.keys}
-        self.cooldown_ok = cooldown_ok   # minor cooldown after success, optional
-        self.cooldown_rl = cooldown_rl   # 429 rate limit
-        self.cooldown_bad = cooldown_bad # 401 invalid
+        self.cooldown_rl = cooldown_rl
+        self.cooldown_bad = cooldown_bad
 
     def current(self):
         now = time.time()
@@ -60,14 +61,15 @@ class ORKeyPool:
         k = self.keys[self.i]
         if now >= self.blocked_until.get(k, 0.0):
             return k
-        # else find next available
-        for _ in range(len(self.keys)):
+        # else seek next
+        start = self.i
+        while True:
             self.i = (self.i + 1) % len(self.keys)
             k = self.keys[self.i]
             if now >= self.blocked_until.get(k, 0.0):
                 return k
-        # all blocked, pick current anyway
-        return self.keys[self.i]
+            if self.i == start:
+                return self.keys[self.i]
 
     def advance(self):
         self.i = (self.i + 1) % len(self.keys)
@@ -79,11 +81,6 @@ class ORKeyPool:
     def ban_bad_key(self, key):
         self.blocked_until[key] = max(self.blocked_until.get(key, 0.0), time.time() + self.cooldown_bad)
         self.advance()
-
-    def nudge_after_success(self, key):
-        # Optional small nudge to avoid hammering a single key in very tight loops
-        if self.cooldown_ok > 0:
-            self.blocked_until[key] = max(self.blocked_until.get(key, 0.0), time.time() + 0)
 
 POOL = ORKeyPool(KEY_LIST)
 
@@ -107,28 +104,46 @@ def call_openrouter_with_failover(model, messages, max_attempts=6, backoff=1.5):
             )
             if hasattr(resp, "error") and resp.error:
                 raise RuntimeError(f"OpenRouter error: {resp.error}")
-            POOL.nudge_after_success(key)
             return resp
         except Exception as e:
-            msg = str(e)
+            msg = str(e).lower()
             last_err = e
-            # Heuristics for failover
-            lower = msg.lower()
-            if "429" in lower or "rate limit" in lower or "quota" in lower or "exceeded" in lower:
+            if "429" in msg or "rate limit" in msg or "quota" in msg or "exceeded" in msg:
                 POOL.ban_rate_limited(key)
                 time.sleep(backoff ** attempt)
                 continue
-            if "401" in lower or "unauthorized" in lower or "invalid api key" in lower:
+            if "401" in msg or "unauthorized" in msg or "invalid api key" in msg:
                 POOL.ban_bad_key(key)
                 continue
-            if any(code in lower for code in ["502","503","504","overloaded","temporarily unavailable","gateway","timeout"]):
-                # transient; try different key or retry same after backoff
+            if any(tok in msg for tok in ["502","503","504","overloaded","temporarily unavailable","gateway","timeout"]):
                 POOL.advance()
                 time.sleep(backoff ** attempt)
                 continue
-            # model not found or others: bubble up
             break
     raise last_err
+
+# ========= PTB Safe send helpers & timeouts =========
+async def safe_reply(msg, text=None, html=None, retries=2):
+    for i in range(retries + 1):
+        try:
+            if html is not None:
+                return await msg.reply_html(html)
+            return await msg.reply_text(text)
+        except (TimedOut, NetworkError):
+            await asyncio.sleep(1.5 * (i + 1))
+            continue
+        except Exception:
+            break
+
+async def safe_action(context, chat_id, action, retries=1):
+    for i in range(retries + 1):
+        try:
+            return await context.bot.send_chat_action(chat_id=chat_id, action=action)
+        except (TimedOut, NetworkError):
+            await asyncio.sleep(1.0 * (i + 1))
+            continue
+        except Exception:
+            break
 
 # ========= In-memory bot data =========
 chat_history = {}
@@ -192,7 +207,7 @@ def append_history(chat_id, role, content):
 
 async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        await safe_action(context, update.effective_chat.id, "typing", retries=1)
     except Exception:
         pass
 
@@ -210,30 +225,31 @@ def resolve_user_display(user) -> str:
 
 # ========= Commands =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME)
+    await safe_reply(update.message, text=WELCOME)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Commands: /start, /help, /whoami, /reset, /setnick — Groups: mention @bot par reply; 'hello/hi' par limited greet (cooldown); Reply to bot to continue; Apna naam: 'mera naam <Name>'; /setnick @user <nick> → 'hello nick'; 'ghar/home' → home link; 'time/date' → exact time + group title."
-    )
+    await safe_reply(update.message, text=(
+        "Commands: /start, /help, /whoami, /reset, /setnick — Groups: mention @bot par reply; 'hello/hi' par limited greet (cooldown); "
+        "Reply to bot to continue; Apna naam: 'mera naam <Name>'; /setnick @user <nick> → 'hello nick'; "
+        "'ghar/home' → home link; 'time/date' → exact time + group title."
+    ))
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me_name, me_user, _ = await get_bot_profile(context)
-    await update.message.reply_text(f"Mera naam {AI_NAME} hai (display: {me_name}, @{me_user}). Owner: {OWNER_NAME}")
+    await safe_reply(update.message, text=f"Mera naam {AI_NAME} hai (display: {me_name}, @{me_user}). Owner: {OWNER_NAME}")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     chat_history.pop(chat_id, None)
-    await update.message.reply_text("Context reset ho gaya.")
+    await safe_reply(update.message, text="Context reset ho gaya.")
 
 async def setnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Reply to user's msg: /setnick nickname  OR  /setnick @user nickname (TEXT_MENTION preferred)
     if update.message.reply_to_message and context.args:
         target_user = update.message.reply_to_message.from_user
         nick = " ".join(context.args).strip().lower()
     else:
         if not context.args or len(context.args) < 2:
-            await update.message.reply_text("Use: Reply to user → /setnick nickname  OR  /setnick @user nickname (TEXT_MENTION required)")
+            await safe_reply(update.message, text="Use: Reply to user → /setnick nickname  OR  /setnick @user nickname (TEXT_MENTION required)")
             return
         target_user = None
         nick = " ".join(context.args[1:]).strip().lower()
@@ -243,13 +259,13 @@ async def setnick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     target_user = e.user
                     break
         if not target_user:
-            await update.message.reply_text("User resolve nahi hua. Reply karke /setnick nickname bhejo.")
+            await safe_reply(update.message, text="User resolve nahi hua. Reply karke /setnick nickname bhejo.")
             return
     if not nick or not target_user:
-        await update.message.reply_text("Nickname ya user missing.")
+        await safe_reply(update.message, text="Nickname ya user missing.")
         return
     get_chat_nicks(update.effective_chat.id)[nick] = target_user.id
-    await update.message.reply_text(f"OK, '{nick}' set for {target_user.first_name}.")
+    await safe_reply(update.message, text=f"OK, '{nick}' set for {target_user.first_name}.")
 
 # ========= Text handler =========
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -260,47 +276,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     low = txt.lower()
     chat = update.effective_chat
 
-    # Set preferred name
     m = re.search(r"\b(mera|my)s+naams+([A-Za-z0-9_. -]{1,32})", txt, flags=re.IGNORECASE)
     if m:
         name = m.group(2).strip()
         user_names[msg.from_user.id] = name
-        await msg.reply_text(f"Thik hai, yaad rakha: {name}")
+        await safe_reply(msg, text=f"Thik hai, yaad rakha: {name}")
         return
 
-    # Self username
     if "mera username" in low or "my username" in low:
         u = msg.from_user
-        await msg.reply_text(f"Tumhara username: @{u.username}" if u.username else "Tumhara username set nahin hai.")
+        await safe_reply(msg, text=(f"Tumhara username: @{u.username}" if u.username else "Tumhara username set nahin hai."))
         return
 
-    # Self name
     if ("my name" in low) or ("mera naam" in low and not re.search(r"\b(mera|my)s+naams+[A-Za-z0-9_. -]{1,32}", low)):
         u = msg.from_user
         display = user_names.get(u.id) or (u.first_name or "User")
-        await msg.reply_html(f"Tumhara naam: {mention_html(u.id, display)}")
+        await safe_reply(msg, html=f"Tumhara naam: {mention_html(u.id, display)}")
         return
 
-    # Bot/owner name
     if "tumhara naam" in low or "tera naam" in low or "what is your name" in low:
         me_name, me_user, _ = await get_bot_profile(context)
-        await msg.reply_text(f"Mera naam {AI_NAME} hai (display: {me_name}, @{me_user}). Owner: {OWNER_NAME}")
+        await safe_reply(msg, text=f"Mera naam {AI_NAME} hai (display: {me_name}, @{me_user}). Owner: {OWNER_NAME}")
         return
     if "owner" in low:
-        await msg.reply_text(f"Owner: {OWNER_NAME}")
+        await safe_reply(msg, text=f"Owner: {OWNER_NAME}")
         return
 
-    # Profanity moderation
     if contains_profanity(txt):
         user = msg.from_user
         warn = f"{mention_html(user.id, resolve_user_display(user))} Kripya gaali-galoch se bachen. Sabka respect karein."
         try:
-            await msg.reply_html(warn)
+            await safe_reply(msg, html=warn)
         except Exception:
-            await msg.reply_text("Language theek rakhein, kripya.")
+            await safe_reply(msg, text="Language theek rakhein, kripya.")
         return
 
-    # Group behavior controls
     me_name, me_user, me_id = await get_bot_profile(context)
     if chat.type in ("group", "supergroup"):
         is_reply = msg.reply_to_message is not None
@@ -311,7 +321,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_bot_mentioned(msg, me_user):
             pass
         else:
-            # Plain greet with cooldown
             nt = norm_token(txt)
             if nt in hello_set:
                 now = monotonic()
@@ -322,10 +331,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     greet_cooldown_user[key_u] = now
                     greet_cooldown_chat[chat.id] = now
                     await send_typing(update, context)
-                    await msg.reply_html(f"Hello {mention_html(msg.from_user.id, resolve_user_display(msg.from_user))}! Kaise ho?")
+                    await safe_reply(msg, html=f"Hello {mention_html(msg.from_user.id, resolve_user_display(msg.from_user))}! Kaise ho?")
                 return
 
-            # Targeted greet: @user or /setnick nick
             is_h, target_uid, target_username = extract_hello_target(msg)
             if is_h:
                 now = monotonic()
@@ -338,33 +346,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await send_typing(update, context)
                     sender = mention_html(msg.from_user.id, resolve_user_display(msg.from_user))
                     if target_uid:
-                        await msg.reply_html(f"Hello {mention_html(target_uid, 'friend')}! {sender} ne greet kiya. Kaise ho?")
+                        await safe_reply(msg, html=f"Hello {mention_html(target_uid, 'friend')}! {sender} ne greet kiya. Kaise ho?")
                     elif target_username:
-                        await msg.reply_text(f"Hello {target_username}! {resolve_user_display(msg.from_user)} ne greet kiya. Kaise ho?")
+                        await safe_reply(msg, text=f"Hello {target_username}! {resolve_user_display(msg.from_user)} ne greet kiya. Kaise ho?")
                     else:
                         nick = extract_plain_target_word(txt)
                         uid = get_chat_nicks(chat.id).get((nick or ""), None)
                         if uid:
-                            await msg.reply_html(f"Hello {mention_html(uid, nick or 'friend')}! {sender} ne greet kiya. Kaise ho?")
+                            await safe_reply(msg, html=f"Hello {mention_html(uid, nick or 'friend')}! {sender} ne greet kiya. Kaise ho?")
                         else:
-                            await msg.reply_html(f"Hello {sender}! Kaise ho?")
+                            await safe_reply(msg, html=f"Hello {sender}! Kaise ho?")
                 return
 
-            # Not mention/reply → ignore
             return
 
-    # Intents: home/time (private always; group only if allowed path reached above)
     if any(k in low for k in ["ghar","home","group","link"]) and any(q in low for q in ["konsa","kaunsa","kya","tumhara","tumhra","kaha"]):
-        await msg.reply_text(f"Mera home group: {HOME_GROUP_LINK}")
+        await safe_reply(msg, text=f"Mera home group: {HOME_GROUP_LINK}")
         return
 
     if any(k in low for k in ["time","date","samay","waqt"]):
         now = now_ist()
         title = update.effective_chat.title or "Private chat"
-        await msg.reply_text(f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} | Group: {title}")
+        await safe_reply(msg, text=f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} | Group: {title}")
         return
 
-    # AI response with key failover
     await send_typing(update, context)
     chat_id = chat.id
     append_history(chat_id, "user", txt)
@@ -372,9 +377,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = call_openrouter_with_failover(MODEL, chat_history.get(chat_id))
         reply = resp.choices[0].message.content
         append_history(chat_id, "assistant", reply)
-        await msg.reply_text(reply)
+        await safe_reply(msg, text=reply)
     except Exception as e:
-        await msg.reply_text(f"OpenRouter/API error: {e}")
+        await safe_reply(msg, text=f"OpenRouter/API error: {e}")
 
 # ========= Sticker handler =========
 async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -396,13 +401,19 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kind = "animated sticker"
         elif getattr(st, "is_video", False):
             kind = "video sticker"
-        await msg.reply_text(f"Nice {kind} {emoji}!")
+        await safe_reply(msg, text=f"Nice {kind} {emoji}!")
     except Exception:
-        await msg.reply_text("Cool sticker!")
+        await safe_reply(msg, text="Cool sticker!")
 
 # ========= App bootstrap =========
 def main():
-    app = ApplicationBuilder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+    request = HTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0
+    )
+    app = ApplicationBuilder().token(os.getenv("TELEGRAM_BOT_TOKEN")).request(request).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
