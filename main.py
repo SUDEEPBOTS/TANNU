@@ -3,7 +3,6 @@ from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Env from Heroku Config Vars (no .env needed on Heroku)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SITE_URL = os.getenv("SITE_URL", "https://example.com")
@@ -15,28 +14,25 @@ if not OPENROUTER_API_KEY:
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN missing (set in Heroku Config Vars).")
 
-# OpenRouter via OpenAI SDK
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
     default_headers={
-        "HTTP-Referer": SITE_URL,   # optional attribution
-        "X-Title": SITE_NAME        # optional attribution
+        "HTTP-Referer": SITE_URL,
+        "X-Title": SITE_NAME
     }
 )
 
-# In-memory conversation history per chat
 history = {}
-
 WELCOME = "Namaste! Hinglish me baat karo, main DeepSeek se reply dunga 😊"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIX: close the string properly (single line or triple quotes)
     await update.message.reply_text(
-        "Bas message bhejo; main AI reply de dunga.
-Commands: /reset context clear karta hai."
+        "Bas message bhejo; main AI reply de dunga. /reset se context clear hoga."
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,12 +55,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         completion = client.chat.completions.create(
             model=MODEL,
-            messages=msgs,
-            extra_body={"usage": {"include": True}}  # optional
+            messages=msgs
         )
         reply = completion.choices[0].message.content
         msgs.append({"role": "assistant", "content": reply})
-        # Keep last N turns to limit token usage
         history[chat_id] = msgs[-48:]
         await update.message.reply_text(reply)
     except Exception:
@@ -76,7 +70,6 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    # Polling (simple/reliable on Heroku worker dyno)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
